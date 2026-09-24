@@ -1,15 +1,14 @@
 # Replay emulator plugin SDK
 
-Everything an emulator plugin for Replay builds against. An emulator plugin is a shared
-library emulating one system; the host loads it, drives it one frame at a time, and shows
-what it draws. This tree is staged by the replay_frontend build and published unedited;
-`UPSTREAM` names the host commit it came from.
+Headers and build glue for writing emulator plugins for Replay. A plugin is a shared library
+that emulates one system; the host drives it one frame at a time. `UPSTREAM` names the Replay
+commit this tree was generated from, so don't edit it by hand.
 
 ```
-include/     the plugin ABI (replay/emu_plugin.h) and the flowi headers it needs: arenas, strings, logging
-exports/     host_exports.txt: the host symbols a plugin may call, one per line
-cmake/       ReplaySDK.cmake, the helper a plugin's CMakeLists includes
-scripts/     check_plugin.sh, the import audit for a built plugin
+include/     replay/emu_plugin.h and the flowi headers it uses
+exports/     host_exports.txt, the host symbols a plugin may call
+cmake/       ReplaySDK.cmake
+scripts/     check_plugin.sh, the import check for a built plugin
 examples/    stub-emu, a complete plugin with no emulator behind it
 ```
 
@@ -18,16 +17,18 @@ examples/    stub-emu, a complete plugin with no emulator behind it
 ```c
 #include <replay/emu_plugin.h>
 
+static const RpEmuAPI s_api = { /* ... */ };
+
 RP_EMU_EXPORT const RpEmuAPI* rp_emu_plugin_get(void) {
-    return &my_api;
+    return &s_api;
 }
 
 RP_EMU_PLUGIN_ABI_VERSION_EXPORT()
 ```
 
-`rp_emu_plugin_get` returns the vtable the host drives. `RP_EMU_PLUGIN_ABI_VERSION_EXPORT()`
-exports the ABI version the plugin was built against; the host rejects a plugin whose version
-differs from its own before it reads the vtable. `examples/stub-emu` fills every required slot.
+The host checks the exported ABI version before it reads the vtable, and refuses a mismatch.
+Arenas, strings and logging come from `flowi/arena/arena_macros.h`, `flowi/string/string.h`
+and `flowi/core/log_macros.h`. `examples/stub-emu` fills in every required slot.
 
 ```cmake
 set(REPLAY_SDK_DIR /path/to/replay_emulator_sdk)
@@ -35,25 +36,20 @@ include(${REPLAY_SDK_DIR}/cmake/ReplaySDK.cmake)
 add_replay_emu_plugin(NAME my_system SOURCES my_system.c)
 ```
 
-The output is `my_system.so` (`.dylib` on macOS), with no `lib` prefix. It is installed beside
-the config template whose `plugin` field names it.
+This builds `my_system.so` (`.dylib` on macOS) with no `lib` prefix. Install it next to the
+config template whose `plugin` field names it.
 
-## Calling the host
+## Host calls
 
-A plugin links nothing of the host. Its `arena_*`, `string_*` and `fl_log_*` calls stay
-undefined and the dynamic loader binds them to the host executable at load. The link step
-therefore cannot catch a call the host does not offer, so `scripts/check_plugin.sh` does: it
-fails a plugin that imports a symbol missing from `exports/host_exports.txt`, or that defines
-one of them itself. The CMake helper runs it after every link.
-
-The export list is only the symbols these headers declare. A plugin calling any other host
-function is rejected, even when the host happens to export it.
+A plugin doesn't link against the host. The loader binds its host calls when it is loaded,
+so a missing symbol isn't caught at link time. `scripts/check_plugin.sh` catches it instead:
+it runs after every link and fails if the plugin imports anything not listed in
+`exports/host_exports.txt`, or defines a symbol from that list itself.
 
 ## ABI version
 
-`RP_PLUGIN_ABI_VERSION` covers exactly this SDK: the headers under `include/` and the export
-list. The host's other plugin APIs move without touching it, so a published plugin keeps
-loading until this surface changes. The host's CI fails when it changes without a version bump.
+`RP_PLUGIN_ABI_VERSION` changes only when the headers or the export list change, so a
+built plugin keeps loading across host releases until then.
 
 ## Building the example
 
@@ -61,10 +57,4 @@ loading until this surface changes. The host's CI fails when it changes without 
 cmake -S examples/stub-emu -B out && cmake --build out
 ```
 
-## Platforms
-
-Linux and macOS.
-
-## License
-
-MIT, see `LICENSE`.
+Linux and macOS. MIT licensed, see `LICENSE`.
