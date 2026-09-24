@@ -1,6 +1,6 @@
 # Replay plugin SDK - CMake helper for C plugins.
 #
-#   set(REPLAY_SDK_DIR /path/to/sdk)          # the staged SDK: include/, exports/, cmake/, scripts/, rust/, examples/
+#   set(REPLAY_SDK_DIR /path/to/sdk)
 #   include(${REPLAY_SDK_DIR}/cmake/ReplaySDK.cmake)
 #   add_replay_ui_plugin(NAME my_plugin SOURCES my_plugin.c)
 #   add_replay_emu_plugin(NAME my_system SOURCES my_system.c)

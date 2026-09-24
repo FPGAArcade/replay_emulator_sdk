@@ -2,14 +2,8 @@
 // not optional and synthesizes a framebuffer and an audio ramp from a frame counter, so a given
 // frame index always produces the same bytes.
 //
-// Three build-time variants make the libraries the loader suite rejects: RP_STUB_EMU_OMIT_RUN_FRAME
-// leaves run_frame null, RP_STUB_EMU_OMIT_ABI_VERSION exports no ABI version symbol, and
-// RP_STUB_EMU_WRONG_ABI_VERSION exports one the host cannot match. They combine, which is how the
-// suite observes which of the two checks the loader reaches first. RP_STUB_EMU_OMIT_CONFIG_STRING
-// leaves out the config-string slots, so the host has no way to hand over a ROM directory.
-//
-// Staged under test_plugins/ rather than cores/, so a directory scan never picks it up; the suite
-// loads it by path.
+// The RP_STUB_EMU_* defines build deliberately broken variants for Replay's loader tests; a
+// plugin built from this file leaves them all undefined.
 
 #include <flowi/arena/arena_macros.h>
 #include <flowi/core/log_macros.h>
@@ -37,7 +31,7 @@ typedef struct StubEmuCore {
     u32 frame_index;
     bool media_mounted;
     FlArena* arena;
-    // Read back through get_config_string, so a test can see where the host said the ROMs are.
+    // Returned by get_config_string: where the host said the ROMs are.
     FlString bios_directory;
 } StubEmuCore;
 
@@ -69,7 +63,7 @@ static void stub_emu_destroy(void* core_instance) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Accepts any path: there is no media to read, and the suite only needs the slot to succeed.
+// Accepts any path: there is no media to read.
 
 static bool stub_emu_mount_media(void* core_instance, const char* path) {
     StubEmuCore* core = (StubEmuCore*)core_instance;
