@@ -7,13 +7,52 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <flowi/core/string.h>
+#include <replay/plugin/action_types.h>
 
-#define RP_PLUGIN_ABI_VERSION 1
-#define RP_EMU_MAX_PLAYERS 4
+#define RP_PLUGIN_ABI_VERSION 2
+#define RP_EMU_MAX_PORTS 4
+#define RP_EMU_DIGITAL_ACTIONS 16
+#define RP_EMU_ANALOG_ACTIONS 6
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// What the OSD may offer for a core, one bit each in RpEmuInfo.capabilities.
+// A set bit needs the vtable slots named on it: the host refuses at load a
+// plugin that sets a bit whose slots are null. An unset bit is left out of the
+// OSD.
+typedef enum RpEmuCapability {
+    // Save and load state. Needs serialize and deserialize.
+    RpEmuCapability_SaveState = 1,
+    // Warm boot that keeps RAM and media. Needs reset.
+    RpEmuCapability_SoftReset = 2,
+    // Power cycle; mounted media stays mounted. Needs hard_reset.
+    RpEmuCapability_HardReset = 4,
+    // Eject, insert and flip media per drive. Needs get_media_slots, set_media
+    // and next_side.
+    RpEmuCapability_Media = 8,
+    // DIP switches, as core options written through the config word. Needs
+    // set_config_bitmask.
+    RpEmuCapability_DipSwitches = 16,
+} RpEmuCapability;
+
+// Canonical display label of each RpEmuCapability.
+static inline FlString rp_emu_capability_label(RpEmuCapability value) {
+    switch (value) {
+        case RpEmuCapability_SaveState:
+            return S("Save state");
+        case RpEmuCapability_SoftReset:
+            return S("Soft reset");
+        case RpEmuCapability_HardReset:
+            return S("Hard reset");
+        case RpEmuCapability_Media:
+            return S("Media");
+        case RpEmuCapability_DipSwitches:
+            return S("DIP switches");
+    }
+    return S("");
+}
 
 // Framebuffer pixel format.
 typedef enum RpPixelFormat {
@@ -22,29 +61,6 @@ typedef enum RpPixelFormat {
     // 16-bit, native endian.
     RpPixelFormat_Rgb565 = 1,
 } RpPixelFormat;
-
-// The abstract controller a core sees, independent of the physical pad the host
-// read it from. `Count` is the array-size sentinel and doubles as "this host
-// button has no core equivalent".
-typedef enum RpEmuButton {
-    RpEmuButton_Up = 0,
-    RpEmuButton_Down = 1,
-    RpEmuButton_Left = 2,
-    RpEmuButton_Right = 3,
-    // Primary action.
-    RpEmuButton_A = 4,
-    // Secondary action.
-    RpEmuButton_B = 5,
-    RpEmuButton_X = 6,
-    RpEmuButton_Y = 7,
-    // Left shoulder.
-    RpEmuButton_L = 8,
-    // Right shoulder.
-    RpEmuButton_R = 9,
-    RpEmuButton_Select = 10,
-    RpEmuButton_Start = 11,
-    RpEmuButton_Count = 12,
-} RpEmuButton;
 
 // Where a core is in its lifecycle.
 typedef enum RpEmuLifecycleState {
@@ -77,8 +93,10 @@ typedef enum RpEmuLifecycleState {
 // One monotonic number for the emulator plugin SDK - these headers and the host
 // symbols they declare, nothing else of the host - bumped when any of it changes.
 // See <replay/emu_plugin.h> for the gate.
-// Maximum number of players routed to a core. Players 0-3 map to physical
-// gamepads 0-3.
+// The number of Ports a core is fed, Port 1 first.
+// The digital Actions a core is fed: every RpDigitalAction before Menu, which
+// the host keeps for itself.
+// The analog Actions a core is fed: every RpAnalogAction.
 // The arena a core allocates its instance state from.
 typedef struct FlArena FlArena;
 
@@ -87,8 +105,23 @@ typedef struct RpEmuAPI RpEmuAPI;
 // The entry point a core library exports, named rp_emu_plugin_get.
 typedef const RpEmuAPI* (*RpEmuPluginGetFunc)(void);
 
-// What a loaded core says about itself. The strings are the core's own and stay
-// valid as long as it is loaded.
+// A digital Action a core reads, with what it means on this core.
+typedef struct RpEmuDigitalActionLabel {
+    // Never RpDigitalAction_Menu, which is host-reserved.
+    RpDigitalAction action;
+    // "Fire", "Jump"; shown by the button legend and the controller wizard.
+    const char* label;
+} RpEmuDigitalActionLabel;
+
+// An analog Action a core reads, with what it means on this core.
+typedef struct RpEmuAnalogActionLabel {
+    RpAnalogAction action;
+    // "Steer", "Throttle"; shown by the button legend and the controller wizard.
+    const char* label;
+} RpEmuAnalogActionLabel;
+
+// What a loaded core says about itself. Everything it points at is the core's
+// own and stays valid as long as it is loaded.
 typedef struct RpEmuInfo {
     // "vAmiga", "Vice C64", etc.
     const char* emu_name;
@@ -100,6 +133,16 @@ typedef struct RpEmuInfo {
     const char* supported_extensions;
     // True if a ROM/BIOS is required.
     bool requires_bios;
+    // RpEmuCapability bits OR'd together; fixed for the life of the plugin.
+    uint32_t capabilities;
+    // The digital Actions the core reads, `digital_action_count` long. An Action
+    // left out is still delivered, unlabeled.
+    const RpEmuDigitalActionLabel* digital_actions;
+    uint32_t digital_action_count;
+    // The analog Actions the core reads, `analog_action_count` long. An Action
+    // left out is still delivered, unlabeled.
+    const RpEmuAnalogActionLabel* analog_actions;
+    uint32_t analog_action_count;
 } RpEmuInfo;
 
 // A core's video output format, including the visible area within the frame
@@ -131,20 +174,22 @@ typedef struct RpAudioSpec {
     uint32_t channels;
 } RpAudioSpec;
 
-// One player's gamepad button states, indexed by RpEmuButton. The array length
-// is RpEmuButton_Count, spelled as a literal because the IDL has no
-// constant-resolution pass; <replay/emu_plugin.h> asserts the two agree.
-typedef struct RpEmuPlayerInput {
-    // Button states for this player's gamepad.
-    bool buttons[12];
-} RpEmuPlayerInput;
+// One Port's input as Actions: what the Pad on that Port holds, already through
+// the user's Mapping. The array lengths are RP_EMU_DIGITAL_ACTIONS and
+// RP_EMU_ANALOG_ACTIONS, spelled as literals because the IDL has no
+// constant-resolution pass; <replay/emu_plugin.h> asserts they agree.
+typedef struct RpEmuPortInput {
+    // Indexed by RpDigitalAction; true while held.
+    bool digital[16];
+    // Indexed by RpAnalogAction. Sticks run from -32767 (left, up) to 32767
+    // (right, down); triggers from 0 (released) to 32767 (fully pressed).
+    int16_t analog[6];
+} RpEmuPortInput;
 
-// The full per-frame input snapshot the frontend sends a core. `players[0]`
-// mirrors the legacy `buttons` view, so a single-pad core that only reads
-// `buttons` keeps working while a multiplayer core reads players[1..3].
+// The full per-frame input snapshot the frontend sends a core.
 typedef struct RpEmuInputState {
-    // Player 0 button states (legacy view; mirrors players[0].buttons).
-    bool buttons[12];
+    // Action state per Port, Port 1 first. A Port with no Pad holds nothing.
+    RpEmuPortInput ports[4];
     // Mouse X delta.
     int16_t mouse_x;
     // Mouse Y delta.
@@ -155,10 +200,18 @@ typedef struct RpEmuInputState {
     bool mouse_right;
     // Keyboard state, indexed by scan code.
     bool keyboard_keys[256];
-    // Per-player gamepad input for players 0-3. Appended last to keep the
-    // layout compatible with cores built before it existed.
-    RpEmuPlayerInput players[4];
 } RpEmuInputState;
+
+// One media drive of a core, as get_media_slots reports it.
+typedef struct RpEmuMediaSlot {
+    // "DF0", "Drive 8", "Cartridge".
+    FlString label;
+    // The path of the inserted media; empty when the drive is empty.
+    FlString inserted_path;
+    // True when the inserted media has more sides or disks than the one in
+    // use, which next_side steps through.
+    bool has_sides;
+} RpEmuMediaSlot;
 
 // The per-frame in/out block passed to run_frame: input from the frontend,
 // video and audio filled in by the core.
@@ -183,9 +236,11 @@ typedef struct RpEmuFrameContext {
     bool skip_frame_pacing;
 } RpEmuFrameContext;
 
-// The functions a core exports. Slots documented as optional may be nullptr.
+// The functions a core exports. get_info, create, destroy, mount_media and
+// run_frame are always required; a slot named by an RpEmuCapability is required
+// when that bit is set; every other slot may be nullptr.
 typedef struct RpEmuAPI {
-    // Report the core's identity; called once during plugin discovery.
+    // Report the core's identity; called once at load, before create.
     void (*get_info)(RpEmuInfo* info);
     // Create a core instance, allocating from `arena` and loading a BIOS if one
     // is needed. Returns nullptr on failure.
@@ -206,9 +261,10 @@ typedef struct RpEmuAPI {
     bool (*mount_media_list)(void* core_instance, const FlString* paths, uint32_t count);
     // Run one frame of emulation into `ctx`.
     void (*run_frame)(void* core_instance, RpEmuFrameContext* ctx);
-    // Soft-reset the emulated system.
+    // Warm boot, keeping RAM and media. Required by RpEmuCapability_SoftReset.
     void (*reset)(void* core_instance);
-    // Hard reset, like power cycling.
+    // Power cycle; mounted media stays mounted. Required by
+    // RpEmuCapability_HardReset.
     void (*hard_reset)(void* core_instance);
     // Report the current video specification.
     void (*get_video_spec)(void* core_instance, RpVideoSpec* spec);
@@ -221,13 +277,15 @@ typedef struct RpEmuAPI {
     // a null slot means the core pushes audio through RpEmuFrameContext.
     uint32_t (*copy_audio)(void* core_instance, float* buffer, uint32_t frame_count);
     // Serialize state into `buffer`, returning the serialized size or 0 on
-    // error; a null `buffer` returns the size required. Optional.
+    // error; a null `buffer` returns the size required. Required by
+    // RpEmuCapability_SaveState.
     size_t (*serialize)(void* core_instance, void* buffer, size_t buffer_size);
-    // Restore state from `buffer`. Optional.
+    // Restore state from `buffer`. Required by RpEmuCapability_SaveState.
     bool (*deserialize)(void* core_instance, const void* buffer, size_t buffer_size);
     // Apply a configuration bitmask to a running core (FPGA cores), in the same
     // format as the launch config. Called when the user changes options in the
-    // OSD; only options marked runtime-modifiable should take effect. Optional.
+    // OSD; only options marked runtime-modifiable should take effect. Required
+    // by RpEmuCapability_DipSwitches.
     void (*set_config_bitmask)(void* core_instance, uint32_t config_value);
     // Apply one typed configuration option by key (software cores like vAmiga),
     // e.g. "CPU.OVERCLOCKING" or "MEM.CHIP_RAM". Called when the user changes
@@ -240,16 +298,39 @@ typedef struct RpEmuAPI {
     // Read back a string configuration value, e.g. the inserted disk path.
     // Returns an empty string for an unset or unknown key. Optional.
     FlString (*get_config_string)(void* core_instance, FlString key);
+    // Describe the core's media drives into `slots`, at most `max_slots` of
+    // them, and return how many drives it has, which may be more. The strings
+    // stay valid until the next call into the core. Required by
+    // RpEmuCapability_Media.
+    uint32_t (*get_media_slots)(void* core_instance, RpEmuMediaSlot* slots, uint32_t max_slots);
+    // Insert the media at `path` into drive `slot`, or eject it when `path` is
+    // empty. False on error. Required by RpEmuCapability_Media.
+    bool (*set_media)(void* core_instance, uint32_t slot, FlString path);
+    // Turn to the next side or disk of the media in drive `slot`, wrapping
+    // after the last. False when it has no other side. Required by
+    // RpEmuCapability_Media.
+    bool (*next_side)(void* core_instance, uint32_t slot);
 } RpEmuAPI;
 
 // Layout pins - the IDL-computed layout of the types above,
 // checked against what this compiler produces.
-static_assert(sizeof(RpEmuInfo) == 40, "RpEmuInfo size drift");
+static_assert(sizeof(RpEmuDigitalActionLabel) == 16, "RpEmuDigitalActionLabel size drift");
+static_assert(offsetof(RpEmuDigitalActionLabel, action) == 0, "RpEmuDigitalActionLabel.action offset drift");
+static_assert(offsetof(RpEmuDigitalActionLabel, label) == 8, "RpEmuDigitalActionLabel.label offset drift");
+static_assert(sizeof(RpEmuAnalogActionLabel) == 16, "RpEmuAnalogActionLabel size drift");
+static_assert(offsetof(RpEmuAnalogActionLabel, action) == 0, "RpEmuAnalogActionLabel.action offset drift");
+static_assert(offsetof(RpEmuAnalogActionLabel, label) == 8, "RpEmuAnalogActionLabel.label offset drift");
+static_assert(sizeof(RpEmuInfo) == 72, "RpEmuInfo size drift");
 static_assert(offsetof(RpEmuInfo, emu_name) == 0, "RpEmuInfo.emu_name offset drift");
 static_assert(offsetof(RpEmuInfo, emu_version) == 8, "RpEmuInfo.emu_version offset drift");
 static_assert(offsetof(RpEmuInfo, system_name) == 16, "RpEmuInfo.system_name offset drift");
 static_assert(offsetof(RpEmuInfo, supported_extensions) == 24, "RpEmuInfo.supported_extensions offset drift");
 static_assert(offsetof(RpEmuInfo, requires_bios) == 32, "RpEmuInfo.requires_bios offset drift");
+static_assert(offsetof(RpEmuInfo, capabilities) == 36, "RpEmuInfo.capabilities offset drift");
+static_assert(offsetof(RpEmuInfo, digital_actions) == 40, "RpEmuInfo.digital_actions offset drift");
+static_assert(offsetof(RpEmuInfo, digital_action_count) == 48, "RpEmuInfo.digital_action_count offset drift");
+static_assert(offsetof(RpEmuInfo, analog_actions) == 56, "RpEmuInfo.analog_actions offset drift");
+static_assert(offsetof(RpEmuInfo, analog_action_count) == 64, "RpEmuInfo.analog_action_count offset drift");
 static_assert(sizeof(RpVideoSpec) == 32, "RpVideoSpec size drift");
 static_assert(offsetof(RpVideoSpec, width) == 0, "RpVideoSpec.width offset drift");
 static_assert(offsetof(RpVideoSpec, height) == 4, "RpVideoSpec.height offset drift");
@@ -262,16 +343,20 @@ static_assert(offsetof(RpVideoSpec, visible_height) == 28, "RpVideoSpec.visible_
 static_assert(sizeof(RpAudioSpec) == 8, "RpAudioSpec size drift");
 static_assert(offsetof(RpAudioSpec, sample_rate) == 0, "RpAudioSpec.sample_rate offset drift");
 static_assert(offsetof(RpAudioSpec, channels) == 4, "RpAudioSpec.channels offset drift");
-static_assert(sizeof(RpEmuPlayerInput) == 12, "RpEmuPlayerInput size drift");
-static_assert(offsetof(RpEmuPlayerInput, buttons) == 0, "RpEmuPlayerInput.buttons offset drift");
-static_assert(sizeof(RpEmuInputState) == 322, "RpEmuInputState size drift");
-static_assert(offsetof(RpEmuInputState, buttons) == 0, "RpEmuInputState.buttons offset drift");
-static_assert(offsetof(RpEmuInputState, mouse_x) == 12, "RpEmuInputState.mouse_x offset drift");
-static_assert(offsetof(RpEmuInputState, mouse_y) == 14, "RpEmuInputState.mouse_y offset drift");
-static_assert(offsetof(RpEmuInputState, mouse_left) == 16, "RpEmuInputState.mouse_left offset drift");
-static_assert(offsetof(RpEmuInputState, mouse_right) == 17, "RpEmuInputState.mouse_right offset drift");
-static_assert(offsetof(RpEmuInputState, keyboard_keys) == 18, "RpEmuInputState.keyboard_keys offset drift");
-static_assert(offsetof(RpEmuInputState, players) == 274, "RpEmuInputState.players offset drift");
+static_assert(sizeof(RpEmuPortInput) == 28, "RpEmuPortInput size drift");
+static_assert(offsetof(RpEmuPortInput, digital) == 0, "RpEmuPortInput.digital offset drift");
+static_assert(offsetof(RpEmuPortInput, analog) == 16, "RpEmuPortInput.analog offset drift");
+static_assert(sizeof(RpEmuInputState) == 374, "RpEmuInputState size drift");
+static_assert(offsetof(RpEmuInputState, ports) == 0, "RpEmuInputState.ports offset drift");
+static_assert(offsetof(RpEmuInputState, mouse_x) == 112, "RpEmuInputState.mouse_x offset drift");
+static_assert(offsetof(RpEmuInputState, mouse_y) == 114, "RpEmuInputState.mouse_y offset drift");
+static_assert(offsetof(RpEmuInputState, mouse_left) == 116, "RpEmuInputState.mouse_left offset drift");
+static_assert(offsetof(RpEmuInputState, mouse_right) == 117, "RpEmuInputState.mouse_right offset drift");
+static_assert(offsetof(RpEmuInputState, keyboard_keys) == 118, "RpEmuInputState.keyboard_keys offset drift");
+static_assert(sizeof(RpEmuMediaSlot) == 40, "RpEmuMediaSlot size drift");
+static_assert(offsetof(RpEmuMediaSlot, label) == 0, "RpEmuMediaSlot.label offset drift");
+static_assert(offsetof(RpEmuMediaSlot, inserted_path) == 16, "RpEmuMediaSlot.inserted_path offset drift");
+static_assert(offsetof(RpEmuMediaSlot, has_sides) == 32, "RpEmuMediaSlot.has_sides offset drift");
 static_assert(sizeof(RpEmuFrameContext) == 64, "RpEmuFrameContext size drift");
 static_assert(offsetof(RpEmuFrameContext, input) == 0, "RpEmuFrameContext.input offset drift");
 static_assert(offsetof(RpEmuFrameContext, video_buffer) == 8, "RpEmuFrameContext.video_buffer offset drift");
@@ -282,7 +367,7 @@ static_assert(offsetof(RpEmuFrameContext, audio_buffer) == 32, "RpEmuFrameContex
 static_assert(offsetof(RpEmuFrameContext, audio_frames) == 40, "RpEmuFrameContext.audio_frames offset drift");
 static_assert(offsetof(RpEmuFrameContext, delta_time) == 48, "RpEmuFrameContext.delta_time offset drift");
 static_assert(offsetof(RpEmuFrameContext, skip_frame_pacing) == 56, "RpEmuFrameContext.skip_frame_pacing offset drift");
-static_assert(sizeof(RpEmuAPI) == 168, "RpEmuAPI size drift");
+static_assert(sizeof(RpEmuAPI) == 192, "RpEmuAPI size drift");
 static_assert(offsetof(RpEmuAPI, get_info) == 0, "RpEmuAPI.get_info offset drift");
 static_assert(offsetof(RpEmuAPI, create) == 8, "RpEmuAPI.create offset drift");
 static_assert(offsetof(RpEmuAPI, destroy) == 16, "RpEmuAPI.destroy offset drift");
@@ -304,6 +389,9 @@ static_assert(offsetof(RpEmuAPI, set_config_float) == 136, "RpEmuAPI.set_config_
 static_assert(offsetof(RpEmuAPI, set_config_bool) == 144, "RpEmuAPI.set_config_bool offset drift");
 static_assert(offsetof(RpEmuAPI, set_config_string) == 152, "RpEmuAPI.set_config_string offset drift");
 static_assert(offsetof(RpEmuAPI, get_config_string) == 160, "RpEmuAPI.get_config_string offset drift");
+static_assert(offsetof(RpEmuAPI, get_media_slots) == 168, "RpEmuAPI.get_media_slots offset drift");
+static_assert(offsetof(RpEmuAPI, set_media) == 176, "RpEmuAPI.set_media offset drift");
+static_assert(offsetof(RpEmuAPI, next_side) == 184, "RpEmuAPI.next_side offset drift");
 
 
 #ifdef __cplusplus

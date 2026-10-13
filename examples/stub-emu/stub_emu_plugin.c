@@ -1,6 +1,11 @@
-// A deterministic emulator plugin with no emulator behind it. It fills the RpEmuAPI slots that are
-// not optional and synthesizes a framebuffer and an audio ramp from a frame counter, so a given
-// frame index always produces the same bytes.
+// A deterministic emulator plugin with no emulator behind it. It synthesizes a framebuffer and an
+// audio ramp from a frame counter, so a given frame index always produces the same bytes, and it
+// declares every RpEmuCapability with the slots each one needs, so it is the reference for what a
+// complete plugin fills in:
+//
+//   RpEmuInfo.capabilities     the OSD items the core backs, each with its slots below
+//   RpEmuInfo.digital_actions  the Actions the core reads, with its own label for each
+//   run_frame                  reads Port 1's Action state from ctx->input->ports[0]
 //
 // The RP_STUB_EMU_* defines build deliberately broken variants for Replay's loader tests; a
 // plugin built from this file leaves them all undefined.
@@ -20,8 +25,20 @@
 #define STUB_EMU_CHANNELS 2
 // One video frame's worth of audio, which divides exactly at these two rates.
 #define STUB_EMU_FRAMES_PER_CALL (STUB_EMU_SAMPLE_RATE / STUB_EMU_FPS)
+// The one drive get_media_slots reports, and the sides of what is inserted in it.
+#define STUB_EMU_DRIVE 0
+#define STUB_EMU_DRIVES 1
+#define STUB_EMU_SIDES 2
+// Every blue bit, flipped while Port 1 holds Action.
+#define STUB_EMU_BLUE_MASK 0xffu
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// What serialize writes: the state run_frame's output depends on.
+typedef struct StubEmuState {
+    u32 frame_index;
+    u32 media_side;
+} StubEmuState;
 
 typedef struct StubEmuCore {
     u32 pixels[STUB_EMU_WIDTH * STUB_EMU_HEIGHT];
@@ -30,10 +47,30 @@ typedef struct StubEmuCore {
     // generators, which is what makes a frame index reproduce its bytes.
     u32 frame_index;
     bool media_mounted;
+    // What is in the drive, and which of its sides is in use.
+    FlString media_path;
+    u32 media_side;
+    // The last word set_config_bitmask wrote.
+    u32 config_bitmask;
     FlArena* arena;
     // Returned by get_config_string: where the host said the ROMs are.
     FlString bios_directory;
 } StubEmuCore;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static const RpEmuDigitalActionLabel STUB_EMU_DIGITAL_ACTIONS[] = {
+    { RpDigitalAction_Up, "Up" },
+    { RpDigitalAction_Down, "Down" },
+    { RpDigitalAction_Left, "Left" },
+    { RpDigitalAction_Right, "Right" },
+    { RpDigitalAction_Action, "Fire" },
+    { RpDigitalAction_Start, "Pause" },
+};
+
+static const RpEmuAnalogActionLabel STUB_EMU_ANALOG_ACTIONS[] = {
+    { RpAnalogAction_LeftStickX, "Steer" },
+};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -43,6 +80,12 @@ static void stub_emu_get_info(RpEmuInfo* info) {
     info->system_name = "Stub System";
     info->supported_extensions = "stub";
     info->requires_bios = false;
+    info->capabilities = RpEmuCapability_SaveState | RpEmuCapability_SoftReset | RpEmuCapability_HardReset |
+                         RpEmuCapability_Media | RpEmuCapability_DipSwitches;
+    info->digital_actions = STUB_EMU_DIGITAL_ACTIONS;
+    info->digital_action_count = (u32)(sizeof(STUB_EMU_DIGITAL_ACTIONS) / sizeof(STUB_EMU_DIGITAL_ACTIONS[0]));
+    info->analog_actions = STUB_EMU_ANALOG_ACTIONS;
+    info->analog_action_count = (u32)(sizeof(STUB_EMU_ANALOG_ACTIONS) / sizeof(STUB_EMU_ANALOG_ACTIONS[0]));
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -63,20 +106,37 @@ static void stub_emu_destroy(void* core_instance) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Accepts any path: there is no media to read.
+// There is no media to read, so any path is accepted except one naming an entry that starts with "reject", which
+// lets a test drive a core refusing media.
 
-static bool stub_emu_mount_media(void* core_instance, const char* path) {
-    StubEmuCore* core = (StubEmuCore*)core_instance;
-    UNUSED(path);
+static bool stub_emu_insert(StubEmuCore* core, FlString path) {
+    if (string_find_substr(path, S("/reject")) >= 0) {
+        return false;
+    }
+    core->media_path = string_copy(core->arena, path);
+    core->media_side = 0;
     core->media_mounted = true;
     return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static void stub_emu_unmount_media(void* core_instance) {
-    StubEmuCore* core = (StubEmuCore*)core_instance;
+static void stub_emu_eject(StubEmuCore* core) {
+    core->media_path = string_empty();
+    core->media_side = 0;
     core->media_mounted = false;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static bool stub_emu_mount_media(void* core_instance, const char* path) {
+    return stub_emu_insert((StubEmuCore*)core_instance, string_from_cstr(path));
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void stub_emu_unmount_media(void* core_instance) {
+    stub_emu_eject((StubEmuCore*)core_instance);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -86,13 +146,18 @@ static void stub_emu_unmount_media(void* core_instance) {
 static void stub_emu_run_frame(void* core_instance, RpEmuFrameContext* ctx) {
     StubEmuCore* core = (StubEmuCore*)core_instance;
 
+    // Port 1's Action state, already through the player's Mapping: Fire inverts the blue channel, so a
+    // test can see input arrive.
+    const RpEmuPortInput* port = &ctx->input->ports[0];
+    const u32 blue_flip = port->digital[RpDigitalAction_Action] ? STUB_EMU_BLUE_MASK : 0;
+
     // A diagonal gradient scrolling with the frame counter: every channel varies across both axes
     // and over time, so a stuck row, column or frame shows up as a byte difference.
     for (u32 y = 0; y < STUB_EMU_HEIGHT; y++) {
         for (u32 x = 0; x < STUB_EMU_WIDTH; x++) {
             const u32 red = (x + core->frame_index) & 0xff;
             const u32 green = (y + core->frame_index) & 0xff;
-            const u32 blue = (x + y + core->frame_index) & 0xff;
+            const u32 blue = ((x + y + core->frame_index) & 0xff) ^ blue_flip;
             core->pixels[(y * STUB_EMU_WIDTH) + x] = (red << 16) | (green << 8) | blue;
         }
     }
@@ -126,10 +191,11 @@ static void stub_emu_reset(void* core_instance) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// A power cycle, so the inserted media stays in the drive.
 static void stub_emu_hard_reset(void* core_instance) {
     StubEmuCore* core = (StubEmuCore*)core_instance;
     core->frame_index = 0;
-    core->media_mounted = false;
+    core->media_side = 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -159,6 +225,87 @@ static void stub_emu_get_audio_spec(void* core_instance, RpAudioSpec* spec) {
 static RpEmuLifecycleState stub_emu_get_state(void* core_instance) {
     StubEmuCore* core = (StubEmuCore*)core_instance;
     return core->media_mounted ? RpEmuLifecycleState_Running : RpEmuLifecycleState_Idle;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static size_t stub_emu_serialize(void* core_instance, void* buffer, size_t buffer_size) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    if (buffer == nullptr) {
+        return sizeof(StubEmuState);
+    }
+    if (buffer_size < sizeof(StubEmuState)) {
+        fl_log_error("Stub emu: a %u byte state does not fit %u bytes", (u32)sizeof(StubEmuState), (u32)buffer_size);
+        return 0;
+    }
+    StubEmuState* state = (StubEmuState*)buffer;
+    state->frame_index = core->frame_index;
+    state->media_side = core->media_side;
+    return sizeof(StubEmuState);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifndef RP_STUB_EMU_OMIT_DESERIALIZE
+
+static bool stub_emu_deserialize(void* core_instance, const void* buffer, size_t buffer_size) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    if (buffer_size != sizeof(StubEmuState)) {
+        fl_log_error("Stub emu: a state is %u bytes, not %u", (u32)sizeof(StubEmuState), (u32)buffer_size);
+        return false;
+    }
+    const StubEmuState* state = (const StubEmuState*)buffer;
+    core->frame_index = state->frame_index;
+    core->media_side = state->media_side;
+    return true;
+}
+
+#endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void stub_emu_set_config_bitmask(void* core_instance, u32 config_value) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    core->config_bitmask = config_value;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static u32 stub_emu_get_media_slots(void* core_instance, RpEmuMediaSlot* slots, u32 max_slots) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    if (max_slots > STUB_EMU_DRIVE) {
+        slots[STUB_EMU_DRIVE] = (RpEmuMediaSlot){
+            .label = S("Stub drive"),
+            .inserted_path = core->media_path,
+            .has_sides = core->media_mounted,
+        };
+    }
+    return STUB_EMU_DRIVES;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static bool stub_emu_set_media(void* core_instance, u32 slot, FlString path) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    if (slot != STUB_EMU_DRIVE) {
+        return false;
+    }
+    if (path.length == 0) {
+        stub_emu_eject(core);
+        return true;
+    }
+    return stub_emu_insert(core, path);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static bool stub_emu_next_side(void* core_instance, u32 slot) {
+    StubEmuCore* core = (StubEmuCore*)core_instance;
+    if (slot != STUB_EMU_DRIVE || !core->media_mounted) {
+        return false;
+    }
+    core->media_side = (core->media_side + 1) % STUB_EMU_SIDES;
+    return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -200,6 +347,14 @@ static RpEmuAPI stub_emu_api = {
     .get_video_spec = stub_emu_get_video_spec,
     .get_audio_spec = stub_emu_get_audio_spec,
     .get_state = stub_emu_get_state,
+    .serialize = stub_emu_serialize,
+#ifndef RP_STUB_EMU_OMIT_DESERIALIZE
+    .deserialize = stub_emu_deserialize,
+#endif
+    .set_config_bitmask = stub_emu_set_config_bitmask,
+    .get_media_slots = stub_emu_get_media_slots,
+    .set_media = stub_emu_set_media,
+    .next_side = stub_emu_next_side,
 #ifndef RP_STUB_EMU_OMIT_CONFIG_STRING
     .set_config_string = stub_emu_set_config_string,
     .get_config_string = stub_emu_get_config_string,
@@ -216,13 +371,13 @@ RP_EMU_EXPORT const RpEmuAPI* rp_emu_plugin_get(void) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if defined(RP_STUB_EMU_WRONG_ABI_VERSION)
+#if defined(RP_STUB_EMU_REPORTED_ABI_VERSION)
 
-// Spelled out rather than through RP_EMU_PLUGIN_ABI_VERSION_EXPORT(), because the point of this
-// variant is to disagree with the host's constant.
+// Spelled out rather than through RP_EMU_PLUGIN_ABI_VERSION_EXPORT(), because the point of these
+// variants is to disagree with the host's constant.
 
 RP_EMU_EXPORT uint64_t rp_emu_plugin_abi_version(void) {
-    return RP_PLUGIN_ABI_VERSION + 1;
+    return RP_STUB_EMU_REPORTED_ABI_VERSION;
 }
 
 #elif !defined(RP_STUB_EMU_OMIT_ABI_VERSION)
